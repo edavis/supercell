@@ -1,7 +1,8 @@
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::env;
 use supercell::cache::Cache;
 use supercell::cache::CacheTask;
@@ -48,7 +49,12 @@ async fn main() -> Result<()> {
     client_builder = client_builder.user_agent(config.user_agent.clone());
     let http_client = client_builder.build()?;
 
-    let pool = SqlitePool::connect(&config.database_url).await?;
+    let connect_options = SqliteConnectOptions::from_str(&config.database_url)?
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .create_if_missing(true)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+
+    let pool = SqlitePool::connect_with(connect_options).await?;
     sqlx::migrate!().run(&pool).await?;
 
     let feeds: HashMap<String, (Option<String>, HashSet<String>)> = config
@@ -218,6 +224,11 @@ async fn main() -> Result<()> {
     }
 
     tracker.wait().await;
+
+    tracing::info!("closing database connection pool");
+    pool.close().await;
+
+    tracing::info!("shutdown complete");
 
     Ok(())
 }
