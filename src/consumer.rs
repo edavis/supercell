@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
+use chrono::DateTime;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use http::HeaderValue;
@@ -114,6 +115,10 @@ impl ConsumerTask {
         let sleeper = sleep(interval);
         tokio::pin!(sleeper);
 
+        let heartbeat_interval = std::time::Duration::from_secs(15);
+        let heartbeat_sleeper = sleep(heartbeat_interval);
+        tokio::pin!(heartbeat_sleeper);
+
         let mut time_usec = 0i64;
 
         loop {
@@ -124,6 +129,15 @@ impl ConsumerTask {
                 () = &mut sleeper => {
                         consumer_control_insert(&self.pool, &self.config.jetstream_hostname, time_usec).await?;
                         sleeper.as_mut().reset(Instant::now() + interval);
+                },
+                () = &mut heartbeat_sleeper => {
+                    if time_usec > 0 {
+                        let datetime = DateTime::from_timestamp_micros(time_usec)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_else(|| format!("{} microseconds", time_usec));
+                        tracing::info!(time_us = time_usec, timestamp = %datetime, "consumer heartbeat");
+                    }
+                    heartbeat_sleeper.as_mut().reset(Instant::now() + heartbeat_interval);
                 },
                 item = client.next() => {
                     if item.is_none() {
