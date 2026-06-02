@@ -140,7 +140,12 @@ impl ConsumerTask {
 
                     let event = if self.config.compression {
                         if !item.is_binary() {
-                            tracing::debug!("compression enabled but message from jetstream is not binary");
+                            // Skip WebSocket control frames (ping, pong, close)
+                            if item.is_ping() || item.is_pong() || item.is_close() {
+                                continue;
+                            }
+                            // Log unexpected non-binary message types
+                            tracing::warn!("received unexpected non-binary message from jetstream (not ping/pong/close)");
                             continue;
                         }
                         let payload = item.into_payload();
@@ -155,7 +160,12 @@ impl ConsumerTask {
                         .context(anyhow!("cannot deserialize message"))
                     } else {
                         if !item.is_text() {
-                            tracing::debug!("compression enabled but message from jetstream is not binary");
+                            // Skip WebSocket control frames (ping, pong, close)
+                            if item.is_ping() || item.is_pong() || item.is_close() {
+                                continue;
+                            }
+                            // Log unexpected non-text message types
+                            tracing::warn!("received unexpected non-text message from jetstream (not ping/pong/close)");
                             continue;
                         }
                         item.as_text()
