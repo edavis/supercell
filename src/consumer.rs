@@ -63,6 +63,8 @@ impl ConsumerTask {
         let last_time_us =
             consumer_control_get(&self.pool, &self.config.jetstream_hostname).await?;
 
+        tracing::info!(cursor = ?last_time_us, "loaded cursor from database");
+
         let cursor_param = if let Some(cursor) = last_time_us {
             format!("&cursor={}", cursor)
         } else {
@@ -75,7 +77,7 @@ impl ConsumerTask {
         ))
         .context("invalid jetstream URL")?;
 
-        tracing::debug!(uri = ?uri, "connecting to jetstream");
+        tracing::info!(uri = %uri, "connecting to jetstream");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
             .add_header(
@@ -94,6 +96,8 @@ impl ConsumerTask {
         };
         let serialized_update = serde_json::to_string(&update)
             .map_err(|err| anyhow::Error::msg(err).context("cannot serialize update"))?;
+
+        tracing::info!(message = %serialized_update, "sending subscription update to jetstream");
 
         client
             .send(Message::text(serialized_update))
@@ -196,7 +200,15 @@ impl ConsumerTask {
                     }
                     let event = event.unwrap();
 
+                    let previous_time_usec = time_usec;
                     time_usec = std::cmp::max(time_usec, event.time_us);
+
+                    if previous_time_usec == 0 {
+                        let datetime = DateTime::from_timestamp_micros(event.time_us)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_else(|| format!("{} microseconds", event.time_us));
+                        tracing::info!(time_us = event.time_us, timestamp = %datetime, "received first event from jetstream");
+                    }
 
                     if event.clone().kind != "commit" {
                         continue;
