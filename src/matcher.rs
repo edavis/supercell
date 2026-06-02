@@ -6,7 +6,13 @@ use serde_json_path::JsonPath;
 use rhai::{
     serde::to_dynamic, Array, CustomType, Dynamic, Engine, ImmutableString, Scope, TypeBuilder, AST,
 };
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use regex::Regex;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Mutex, OnceLock},
+};
 
 use crate::config;
 
@@ -315,6 +321,33 @@ pub fn matcher_sequence_matches(sequence: Array, text: ImmutableString) -> bool 
     sequence_matches(sequence.as_ref(), &text)
 }
 
+pub fn matcher_matches(text: ImmutableString, pattern: ImmutableString) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<String, Regex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let mut cache = match cache.lock() {
+        Ok(cache) => cache,
+        Err(err) => {
+            tracing::warn!(error = ?err, "regex cache lock poisoned");
+            return false;
+        }
+    };
+
+    if !cache.contains_key(pattern.as_str()) {
+        match Regex::new(&pattern) {
+            Ok(regex) => {
+                cache.insert(pattern.to_string(), regex);
+            }
+            Err(err) => {
+                tracing::warn!(error = ?err, pattern = %pattern, "error compiling regex");
+                return false;
+            }
+        }
+    }
+
+    cache[pattern.as_str()].is_match(&text)
+}
+
 fn sequence_matches(sequence: &[String], text: &str) -> bool {
     let mut last_found: i32 = -1;
 
@@ -419,6 +452,7 @@ impl RhaiMatcher {
             .build_type::<Match>()
             .register_fn("build_aturi", build_aturi)
             .register_fn("sequence_matches", matcher_sequence_matches)
+            .register_fn("matches", matcher_matches)
             .register_fn("matcher_before_duration", matcher_before_duration)
             .register_fn("update_match", Match::update)
             .register_fn("upsert_match", Match::upsert);

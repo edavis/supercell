@@ -40,6 +40,7 @@ tower = { version = "0.5.1", features = ["limit", "timeout", "tokio", "tracing"]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "chrono", "json"] }
 tracing = { version = "0.1.40", features = ["async-await", "log", "valuable"] }
 zstd = "0.13.2"
+regex = "1.11.1"
 reqwest = { version = "0.12.9", features = ["json", "zstd", "rustls-tls"] }
 rhai = { version = "1.20.0", features = ["serde", "std", "sync"]}
 duration-str = "0.11.2"
