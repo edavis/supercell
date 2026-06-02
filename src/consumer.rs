@@ -62,9 +62,15 @@ impl ConsumerTask {
         let last_time_us =
             consumer_control_get(&self.pool, &self.config.jetstream_hostname).await?;
 
+        let cursor_param = if let Some(cursor) = last_time_us {
+            format!("&cursor={}", cursor)
+        } else {
+            String::new()
+        };
+
         let uri = Uri::from_str(&format!(
-            "wss://{}/subscribe?compress={}&requireHello=true",
-            self.config.jetstream_hostname, self.config.compression
+            "wss://{}/subscribe?compress={}&requireHello=true{}",
+            self.config.jetstream_hostname, self.config.compression, cursor_param
         ))
         .context("invalid jetstream URL")?;
 
@@ -83,7 +89,7 @@ impl ConsumerTask {
             wanted_collections: self.config.collections.clone(),
             wanted_dids: vec![],
             max_message_size_bytes: MAX_MESSAGE_SIZE as u64,
-            cursor: last_time_us,
+            cursor: None,
         };
         let serialized_update = serde_json::to_string(&update)
             .map_err(|err| anyhow::Error::msg(err).context("cannot serialize update"))?;
