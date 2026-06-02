@@ -43,7 +43,7 @@ pub async fn feed_content_upsert(pool: &StoragePool, feed_content: &FeedContent)
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
 
     let now = Utc::now();
-    let res = sqlx::query("INSERT OR REPLACE INTO feed_content (feed_id, uri, indexed_at, updated_at, score) VALUES (?, ?, ?, ?, ?)")
+    let res = sqlx::query("INSERT OR IGNORE INTO feed_content (feed_id, uri, indexed_at, updated_at, score) VALUES (?, ?, ?, ?, ?)")
         .bind(&feed_content.feed_id)
         .bind(&feed_content.uri)
         .bind(feed_content.indexed_at)
