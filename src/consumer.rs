@@ -174,12 +174,33 @@ impl ConsumerTask {
                     }
                     let item = item.unwrap();
 
+                    // Handle control frames once, independent of payload
+                    // compression (control frames are never compressed).
+                    if item.is_ping() {
+                        // tokio-websockets queues a pong when it reads a ping
+                        // but only sends it on flush. We otherwise never write
+                        // after the initial subscription, so flush now or
+                        // jetstream never sees our keepalive reply.
+                        if let Err(err) = client.flush().await {
+                            tracing::warn!(error = ?err, "failed to flush pong response");
+                        }
+                        continue;
+                    }
+                    if item.is_pong() {
+                        continue;
+                    }
+                    if item.is_close() {
+                        match item.as_close() {
+                            Some((code, reason)) => {
+                                tracing::warn!(?code, reason = %reason, "jetstream sent close frame");
+                            }
+                            None => tracing::warn!("jetstream sent close frame"),
+                        }
+                        continue;
+                    }
+
                     let event = if self.config.compression {
                         if !item.is_binary() {
-                            // Skip WebSocket control frames (ping, pong, close)
-                            if item.is_ping() || item.is_pong() || item.is_close() {
-                                continue;
-                            }
                             // Log unexpected non-binary message types
                             tracing::warn!("received unexpected non-binary message from jetstream (not ping/pong/close)");
                             continue;
@@ -196,10 +217,6 @@ impl ConsumerTask {
                         .context(anyhow!("cannot deserialize message"))
                     } else {
                         if !item.is_text() {
-                            // Skip WebSocket control frames (ping, pong, close)
-                            if item.is_ping() || item.is_pong() || item.is_close() {
-                                continue;
-                            }
                             // Log unexpected non-text message types
                             tracing::warn!("received unexpected non-text message from jetstream (not ping/pong/close)");
                             continue;
