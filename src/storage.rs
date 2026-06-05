@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use chrono::{prelude::*, Duration};
 use sqlx::{Execute, Pool, QueryBuilder, Sqlite};
 
+use std::collections::HashSet;
+
+use crate::matcher::MatchOperation;
 use model::FeedContent;
 
 pub type StoragePool = Pool<Sqlite>;
@@ -39,37 +42,32 @@ pub mod model {
     }
 }
 
-pub async fn feed_content_upsert(pool: &StoragePool, feed_content: &FeedContent) -> Result<()> {
-    let mut tx = pool.begin().await.context("failed to begin transaction")?;
-
-    let now = Utc::now();
+async fn feed_content_upsert_tx(
+    conn: &mut sqlx::SqliteConnection,
+    feed_content: &FeedContent,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let res = sqlx::query("INSERT OR IGNORE INTO feed_content (feed_id, uri, indexed_at, updated_at, score) VALUES (?, ?, ?, ?, ?)")
         .bind(&feed_content.feed_id)
         .bind(&feed_content.uri)
         .bind(feed_content.indexed_at)
         .bind(now)
         .bind(feed_content.score)
-        .execute(tx.as_mut())
+        .execute(&mut *conn)
         .await.context("failed to insert feed content record")?;
 
     if res.rows_affected() == 0 {
-        sqlx::query("UPDATE feed_content SET score = score + ?, updated_at = ? WHERE feed_id = ? AND uri = ?")
-            .bind(feed_content.score)
-            .bind(now)
-            .bind(&feed_content.feed_id)
-            .bind(&feed_content.uri)
-            .execute(tx.as_mut())
-            .await
-            .context("failed to update feed content record")?;
+        feed_content_update_tx(conn, feed_content, now).await?;
     }
 
-    tx.commit().await.context("failed to commit transaction")
+    Ok(())
 }
 
-pub async fn feed_content_update(pool: &StoragePool, feed_content: &FeedContent) -> Result<()> {
-    let mut tx = pool.begin().await.context("failed to begin transaction")?;
-
-    let now = Utc::now();
+async fn feed_content_update_tx(
+    conn: &mut sqlx::SqliteConnection,
+    feed_content: &FeedContent,
+    now: DateTime<Utc>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE feed_content SET score = score + ?, updated_at = ? WHERE feed_id = ? AND uri = ?",
     )
@@ -77,9 +75,53 @@ pub async fn feed_content_update(pool: &StoragePool, feed_content: &FeedContent)
     .bind(now)
     .bind(&feed_content.feed_id)
     .bind(&feed_content.uri)
-    .execute(tx.as_mut())
+    .execute(&mut *conn)
     .await
     .context("failed to update feed content record")?;
+
+    Ok(())
+}
+
+pub async fn feed_content_upsert(pool: &StoragePool, feed_content: &FeedContent) -> Result<()> {
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+
+    feed_content_upsert_tx(tx.as_mut(), feed_content, Utc::now()).await?;
+
+    tx.commit().await.context("failed to commit transaction")
+}
+
+pub async fn feed_content_update(pool: &StoragePool, feed_content: &FeedContent) -> Result<()> {
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+
+    feed_content_update_tx(tx.as_mut(), feed_content, Utc::now()).await?;
+
+    tx.commit().await.context("failed to commit transaction")
+}
+
+/// Apply a batch of matched writes in a single transaction. Operations are
+/// replayed in order so that an upsert followed by score updates for the same
+/// entry produce the same result as applying them one at a time.
+pub async fn feed_content_write_batch(
+    pool: &StoragePool,
+    items: &[(FeedContent, MatchOperation)],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+
+    let now = Utc::now();
+    for (feed_content, op) in items {
+        match op {
+            MatchOperation::Upsert => {
+                feed_content_upsert_tx(tx.as_mut(), feed_content, now).await?;
+            }
+            MatchOperation::Update => {
+                feed_content_update_tx(tx.as_mut(), feed_content, now).await?;
+            }
+        }
+    }
 
     tx.commit().await.context("failed to commit transaction")
 }
@@ -273,6 +315,19 @@ pub async fn denylist_exists(pool: &StoragePool, subjects: &[&str]) -> Result<bo
     Ok(count > 0)
 }
 
+pub async fn denylist_all(pool: &StoragePool) -> Result<HashSet<String>> {
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+
+    let subjects = sqlx::query_scalar::<_, String>("SELECT subject FROM denylist")
+        .fetch_all(tx.as_mut())
+        .await
+        .context("failed to select denylist records")?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+
+    Ok(subjects.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::SqlitePool;
@@ -301,6 +356,49 @@ mod tests {
             "at://did:plc:qadlgs4xioohnhi2jg54mqds/app.bsky.feed.post/3la3bqjg4hx2n"
         );
         assert_eq!(records[0].indexed_at, 1730673934229172_i64);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn write_batch_replays_in_order(pool: SqlitePool) -> sqlx::Result<()> {
+        use crate::matcher::MatchOperation;
+
+        let present = "at://did:plc:qadlgs4xioohnhi2jg54mqds/app.bsky.feed.post/present";
+        let absent = "at://did:plc:qadlgs4xioohnhi2jg54mqds/app.bsky.feed.post/absent";
+
+        let make = |uri: &str, op| {
+            (
+                super::model::FeedContent {
+                    feed_id: "feed".to_string(),
+                    uri: uri.to_string(),
+                    indexed_at: 1730673934229172_i64,
+                    score: 1,
+                },
+                op,
+            )
+        };
+
+        // An upsert followed by two updates for the same entry should accumulate
+        // score, while an update for an entry that was never inserted is a no-op.
+        let batch = vec![
+            make(present, MatchOperation::Upsert),
+            make(present, MatchOperation::Update),
+            make(present, MatchOperation::Update),
+            make(absent, MatchOperation::Update),
+        ];
+
+        super::feed_content_write_batch(&pool, &batch)
+            .await
+            .expect("failed to write batch");
+
+        let records = super::feed_content_cached(&pool, "feed", 5)
+            .await
+            .expect("failed to paginate records");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].uri, present);
+        assert_eq!(records[0].score, 3);
 
         Ok(())
     }

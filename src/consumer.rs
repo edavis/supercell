@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
@@ -17,12 +18,17 @@ use crate::matcher::MatchOperation;
 use crate::storage;
 use crate::storage::consumer_control_get;
 use crate::storage::consumer_control_insert;
-use crate::storage::denylist_exists;
-use crate::storage::feed_content_update;
-use crate::storage::feed_content_upsert;
+use crate::storage::denylist_all;
+use crate::storage::feed_content_write_batch;
 use crate::storage::StoragePool;
 
 const MAX_MESSAGE_SIZE: usize = 25000;
+
+// Matched writes are buffered and flushed in a single transaction once the
+// buffer reaches this size or the flush interval elapses, whichever comes
+// first. Batching keeps the high-volume like stream from issuing one SQLite
+// transaction per event.
+const WRITE_BATCH_MAX_SIZE: usize = 1000;
 
 #[derive(Clone)]
 pub struct ConsumerTaskConfig {
@@ -64,6 +70,9 @@ impl ConsumerTask {
             consumer_control_get(&self.pool, &self.config.jetstream_hostname).await?;
 
         tracing::info!(cursor = ?last_time_us, "loaded cursor from database");
+
+        let mut denylist: HashSet<String> = denylist_all(&self.pool).await?;
+        tracing::info!(count = denylist.len(), "loaded denylist from database");
 
         let cursor_param = if let Some(cursor) = last_time_us {
             format!("&cursor={}", cursor)
@@ -123,6 +132,16 @@ impl ConsumerTask {
         let heartbeat_sleeper = sleep(heartbeat_interval);
         tokio::pin!(heartbeat_sleeper);
 
+        let flush_interval = std::time::Duration::from_secs(1);
+        let flush_sleeper = sleep(flush_interval);
+        tokio::pin!(flush_sleeper);
+
+        let denylist_interval = std::time::Duration::from_secs(60);
+        let denylist_sleeper = sleep(denylist_interval);
+        tokio::pin!(denylist_sleeper);
+
+        let mut write_buffer: Vec<(storage::model::FeedContent, MatchOperation)> = Vec::new();
+
         let mut time_usec = 0i64;
 
         loop {
@@ -131,8 +150,21 @@ impl ConsumerTask {
                     break;
                 },
                 () = &mut sleeper => {
+                        // Flush before advancing the persisted cursor so the
+                        // cursor never moves past matches that are still buffered.
+                        feed_content_write_batch(&self.pool, &write_buffer).await?;
+                        write_buffer.clear();
                         consumer_control_insert(&self.pool, &self.config.jetstream_hostname, time_usec).await?;
                         sleeper.as_mut().reset(Instant::now() + interval);
+                },
+                () = &mut flush_sleeper => {
+                        feed_content_write_batch(&self.pool, &write_buffer).await?;
+                        write_buffer.clear();
+                        flush_sleeper.as_mut().reset(Instant::now() + flush_interval);
+                },
+                () = &mut denylist_sleeper => {
+                        denylist = denylist_all(&self.pool).await?;
+                        denylist_sleeper.as_mut().reset(Instant::now() + denylist_interval);
                 },
                 () = &mut heartbeat_sleeper => {
                     if time_usec > 0 {
@@ -229,8 +261,7 @@ impl ConsumerTask {
                             tracing::debug!(feed_id = ?feed_matcher.feed, "matched event");
 
                             let aturi_did = did_from_aturi(&aturi);
-                            let dids = vec![event.did.as_str(), aturi_did.as_str()];
-                            if denylist_exists(&self.pool, &dids).await? {
+                            if denylist.contains(event.did.as_str()) || denylist.contains(aturi_did.as_str()) {
                                 break 'matchers_loop;
                             }
 
@@ -240,20 +271,21 @@ impl ConsumerTask {
                                 indexed_at: event.clone().time_us,
                                 score: 1,
                             };
-                            match op {
-                                MatchOperation::Upsert => {
-                                    feed_content_upsert(&self.pool, &feed_content).await?;
-                                },
-                                MatchOperation::Update => {
-                                    feed_content_update(&self.pool, &feed_content).await?;
-                                },
-                            }
-
+                            write_buffer.push((feed_content, op));
                         }
+                    }
+
+                    if write_buffer.len() >= WRITE_BATCH_MAX_SIZE {
+                        feed_content_write_batch(&self.pool, &write_buffer).await?;
+                        write_buffer.clear();
                     }
                 }
             }
         }
+
+        // Flush whatever is still buffered before shutting down.
+        feed_content_write_batch(&self.pool, &write_buffer).await?;
+        write_buffer.clear();
 
         tracing::debug!("ConsumerTask stopped");
 
