@@ -8,3 +8,4 @@ pub mod http;
 pub mod matcher;
 pub mod storage;
 pub mod vmc;
+pub mod writer;

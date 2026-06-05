@@ -17,6 +17,8 @@ use supercell::consumer::ConsumerTask;
 use supercell::consumer::ConsumerTaskConfig;
 use supercell::http::context::WebContext;
 use supercell::http::server::build_router;
+use supercell::writer::WriterTask;
+use supercell::writer::WRITE_CHANNEL_CAPACITY;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -116,6 +118,8 @@ async fn main() -> Result<()> {
         let inner_config = config.clone();
         let task_enable = *inner_config.consumer_task_enable.as_ref();
         if task_enable {
+            let (write_tx, write_rx) = tokio::sync::mpsc::channel(WRITE_CHANNEL_CAPACITY);
+
             let consumer_task_config = ConsumerTaskConfig {
                 user_agent: inner_config.user_agent.clone(),
                 compression: *inner_config.compression.as_ref(),
@@ -124,11 +128,25 @@ async fn main() -> Result<()> {
                 feeds: inner_config.feeds.clone(),
                 collections: inner_config.collections.as_ref().clone(),
             };
-            let task = ConsumerTask::new(pool.clone(), consumer_task_config, token.clone())?;
+            let task =
+                ConsumerTask::new(pool.clone(), consumer_task_config, token.clone(), write_tx)?;
             let inner_token = token.clone();
             tracker.spawn(async move {
                 if let Err(err) = task.run_background().await {
                     tracing::warn!(error = ?err, "consumer task error");
+                }
+                inner_token.cancel();
+            });
+
+            let writer = WriterTask::new(
+                pool.clone(),
+                inner_config.jetstream_hostname.clone(),
+                write_rx,
+            );
+            let inner_token = token.clone();
+            tracker.spawn(async move {
+                if let Err(err) = writer.run_background().await {
+                    tracing::warn!(error = ?err, "writer task error");
                 }
                 inner_token.cancel();
             });

@@ -7,6 +7,7 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 use http::HeaderValue;
 use http::Uri;
+use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_websockets::{ClientBuilder, Message};
@@ -14,21 +15,13 @@ use tokio_websockets::{ClientBuilder, Message};
 use crate::config;
 use crate::matcher::FeedMatchers;
 use crate::matcher::Match;
-use crate::matcher::MatchOperation;
 use crate::storage;
 use crate::storage::consumer_control_get;
-use crate::storage::consumer_control_insert;
 use crate::storage::denylist_all;
-use crate::storage::feed_content_write_batch;
 use crate::storage::StoragePool;
+use crate::writer::WriteCommand;
 
 const MAX_MESSAGE_SIZE: usize = 25000;
-
-// Matched writes are buffered and flushed in a single transaction once the
-// buffer reaches this size or the flush interval elapses, whichever comes
-// first. Batching keeps the high-volume like stream from issuing one SQLite
-// transaction per event.
-const WRITE_BATCH_MAX_SIZE: usize = 1000;
 
 #[derive(Clone)]
 pub struct ConsumerTaskConfig {
@@ -45,6 +38,7 @@ pub struct ConsumerTask {
     pool: StoragePool,
     config: ConsumerTaskConfig,
     feed_matchers: FeedMatchers,
+    write_tx: Sender<WriteCommand>,
 }
 
 impl ConsumerTask {
@@ -52,6 +46,7 @@ impl ConsumerTask {
         pool: StoragePool,
         config: ConsumerTaskConfig,
         cancellation_token: CancellationToken,
+        write_tx: Sender<WriteCommand>,
     ) -> Result<Self> {
         let feed_matchers = FeedMatchers::from_config(&config.feeds)?;
 
@@ -60,6 +55,7 @@ impl ConsumerTask {
             cancellation_token,
             config,
             feed_matchers,
+            write_tx,
         })
     }
 
@@ -132,15 +128,9 @@ impl ConsumerTask {
         let heartbeat_sleeper = sleep(heartbeat_interval);
         tokio::pin!(heartbeat_sleeper);
 
-        let flush_interval = std::time::Duration::from_secs(1);
-        let flush_sleeper = sleep(flush_interval);
-        tokio::pin!(flush_sleeper);
-
         let denylist_interval = std::time::Duration::from_secs(60);
         let denylist_sleeper = sleep(denylist_interval);
         tokio::pin!(denylist_sleeper);
-
-        let mut write_buffer: Vec<(storage::model::FeedContent, MatchOperation)> = Vec::new();
 
         let mut time_usec = 0i64;
 
@@ -150,17 +140,13 @@ impl ConsumerTask {
                     break;
                 },
                 () = &mut sleeper => {
-                        // Flush before advancing the persisted cursor so the
-                        // cursor never moves past matches that are still buffered.
-                        feed_content_write_batch(&self.pool, &write_buffer).await?;
-                        write_buffer.clear();
-                        consumer_control_insert(&self.pool, &self.config.jetstream_hostname, time_usec).await?;
+                        // Hand the cursor to the writer task, which flushes any
+                        // buffered writes before persisting it.
+                        self.write_tx
+                            .send(WriteCommand::Checkpoint(time_usec))
+                            .await
+                            .map_err(|_| anyhow!("write channel closed"))?;
                         sleeper.as_mut().reset(Instant::now() + interval);
-                },
-                () = &mut flush_sleeper => {
-                        feed_content_write_batch(&self.pool, &write_buffer).await?;
-                        write_buffer.clear();
-                        flush_sleeper.as_mut().reset(Instant::now() + flush_interval);
                 },
                 () = &mut denylist_sleeper => {
                         denylist = denylist_all(&self.pool).await?;
@@ -271,21 +257,23 @@ impl ConsumerTask {
                                 indexed_at: event.time_us,
                                 score: 1,
                             };
-                            write_buffer.push((feed_content, op));
+                            self.write_tx
+                                .send(WriteCommand::Content(feed_content, op))
+                                .await
+                                .map_err(|_| anyhow!("write channel closed"))?;
                         }
-                    }
-
-                    if write_buffer.len() >= WRITE_BATCH_MAX_SIZE {
-                        feed_content_write_batch(&self.pool, &write_buffer).await?;
-                        write_buffer.clear();
                     }
                 }
             }
         }
 
-        // Flush whatever is still buffered before shutting down.
-        feed_content_write_batch(&self.pool, &write_buffer).await?;
-        write_buffer.clear();
+        // Persist the cursor on the way out (including on a jetstream
+        // disconnect) so progress survives a restart. The writer flushes any
+        // remaining buffered writes before persisting it.
+        let _ = self
+            .write_tx
+            .send(WriteCommand::Checkpoint(time_usec))
+            .await;
 
         tracing::debug!("ConsumerTask stopped");
 
