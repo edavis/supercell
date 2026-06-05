@@ -242,11 +242,11 @@ impl ConsumerTask {
                         tracing::info!(time_us = event.time_us, timestamp = %datetime, "received first event from jetstream");
                     }
 
-                    if event.clone().kind != "commit" {
+                    if event.kind != "commit" {
                         continue;
                     }
 
-                    let event_value = serde_json::to_value(event.clone());
+                    let event_value = serde_json::to_value(&event);
                     if let Err(err) = event_value {
                         tracing::error!(error = ?err, "error processing jetstream message");
                         continue;
@@ -268,7 +268,7 @@ impl ConsumerTask {
                             let feed_content = storage::model::FeedContent{
                                 feed_id: feed_matcher.feed.clone(),
                                 uri: aturi,
-                                indexed_at: event.clone().time_us,
+                                indexed_at: event.time_us,
                                 score: 1,
                             };
                             write_buffer.push((feed_content, op));
