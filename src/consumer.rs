@@ -158,18 +158,16 @@ impl ConsumerTask {
                         denylist_sleeper.as_mut().reset(Instant::now() + denylist_interval);
                 },
                 () = &mut heartbeat_sleeper => {
-                    if time_usec > 0 {
-                        let datetime = DateTime::from_timestamp_micros(time_usec)
-                            .map(|dt| dt.to_rfc3339())
-                            .unwrap_or_else(|| format!("{} microseconds", time_usec));
-                        tracing::info!(
-                            time_us = time_usec,
-                            timestamp = %datetime,
-                            messages_since_last = messages_since_heartbeat,
-                            write_channel_available = self.write_tx.capacity(),
-                            "consumer heartbeat"
-                        );
-                    }
+                    let timestamp = (time_usec > 0)
+                        .then(|| DateTime::from_timestamp_micros(time_usec).map(|dt| dt.to_rfc3339()))
+                        .flatten();
+                    tracing::info!(
+                        time_us = time_usec,
+                        timestamp = ?timestamp,
+                        messages_since_last = messages_since_heartbeat,
+                        write_channel_available = self.write_tx.capacity(),
+                        "consumer heartbeat"
+                    );
                     messages_since_heartbeat = 0;
                     heartbeat_sleeper.as_mut().reset(Instant::now() + heartbeat_interval);
                 },
