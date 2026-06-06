@@ -134,6 +134,11 @@ impl ConsumerTask {
 
         let mut time_usec = 0i64;
 
+        // Diagnostics: socket drain rate and read-stall detection.
+        let mut messages_read: u64 = 0;
+        let mut messages_since_heartbeat: u64 = 0;
+        let mut last_message_at: Option<Instant> = None;
+
         loop {
             tokio::select! {
                 () = self.cancellation_token.cancelled() => {
@@ -157,22 +162,39 @@ impl ConsumerTask {
                         let datetime = DateTime::from_timestamp_micros(time_usec)
                             .map(|dt| dt.to_rfc3339())
                             .unwrap_or_else(|| format!("{} microseconds", time_usec));
-                        tracing::info!(time_us = time_usec, timestamp = %datetime, "consumer heartbeat");
+                        tracing::info!(
+                            time_us = time_usec,
+                            timestamp = %datetime,
+                            messages_since_last = messages_since_heartbeat,
+                            write_channel_available = self.write_tx.capacity(),
+                            "consumer heartbeat"
+                        );
                     }
+                    messages_since_heartbeat = 0;
                     heartbeat_sleeper.as_mut().reset(Instant::now() + heartbeat_interval);
                 },
                 item = client.next() => {
                     if item.is_none() {
-                        tracing::warn!("jetstream connection closed");
+                        let since_last_ms = last_message_at.map(|t| t.elapsed().as_millis());
+                        tracing::warn!(
+                            messages_read,
+                            since_last_message_ms = ?since_last_ms,
+                            "jetstream connection closed"
+                        );
                         break;
                     }
                     let item = item.unwrap();
 
                     if let Err(err) = item {
-                        tracing::error!(error = ?err, "error processing jetstream message");
+                        let since_last_ms = last_message_at.map(|t| t.elapsed().as_millis());
+                        tracing::error!(error = ?err, messages_read, since_last_message_ms = ?since_last_ms, "error reading from jetstream");
                         continue;
                     }
                     let item = item.unwrap();
+
+                    messages_read += 1;
+                    messages_since_heartbeat += 1;
+                    last_message_at = Some(Instant::now());
 
                     // Handle control frames once, independent of payload
                     // compression (control frames are never compressed).
